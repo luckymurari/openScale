@@ -48,6 +48,9 @@ import com.health.openscale.ui.screen.components.CUSTOM_END_DATE_MILLIS_SUFFIX
 import com.health.openscale.ui.screen.components.CUSTOM_START_DATE_MILLIS_SUFFIX
 import com.health.openscale.ui.screen.components.TIME_RANGE_SUFFIX
 import dagger.hilt.android.lifecycle.HiltViewModel
+import com.health.openscale.core.data.Insight
+import com.health.openscale.core.database.InsightDao
+import com.health.openscale.core.services.AiInsightService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
@@ -71,6 +74,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.text.DateFormat
+import java.time.Instant
 import java.util.Date
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.inject.Inject
@@ -94,6 +98,7 @@ class SharedViewModel @Inject constructor(
     private val measurementFacade: MeasurementFacade,
     private val dataManagementFacade: DataManagementFacade,
     private val settingsFacade: SettingsFacade,
+    private val insightDao: InsightDao,
 ) : ViewModel(), SettingsFacade by settingsFacade {
 
     companion object {
@@ -749,3 +754,84 @@ class SharedViewModel @Inject constructor(
         }
     }
 }
+    // -------------------------------------------------------------------------
+    // AI Insights
+    // -------------------------------------------------------------------------
+
+    private val aiInsightService = AiInsightService { getOpenAiApiKey() }
+
+    private val _insightsState = MutableStateFlow(InsightsUiState())
+    val insightsState: StateFlow<InsightsUiState> = _insightsState.asStateFlow()
+
+    fun refreshInsights() {
+        viewModelScope.launch {
+            _insightsState.update { it.copy(isLoading = true, error = null) }
+            
+            val userId = selectedUserId.value ?: return@launch
+            val measurements = measurementFacade.getMeasurementsForUser(userId)
+                .first()
+                .map { it.measurement }
+            
+            val apiKey = getOpenAiApiKey()
+            
+            if (apiKey.isNullOrBlank()) {
+                _insightsState.update { 
+                    it.copy(
+                        isLoading = false, 
+                        isApiKeyConfigured = false,
+                        error = "API key not configured"
+                    ) 
+                }
+                return@launch
+            }
+            
+            aiInsightService.generateInsight(measurements)
+                .onSuccess { insight ->
+                    insightDao.insertInsight(insight)
+                    loadInsights()
+                }
+                .onFailure { e ->
+                    LogManager.e(TAG, "Failed to generate insight", e)
+                    _insightsState.update { 
+                        it.copy(
+                            isLoading = false, 
+                            error = e.message ?: "Unknown error"
+                        ) 
+                    }
+                }
+        }
+    }
+
+    fun loadInsights() {
+        viewModelScope.launch {
+            val apiKeyConfigured = !getOpenAiApiKey().isNullOrBlank()
+            val insights = insightDao.getAllInsights()
+            val lastGenerated = insights.maxOfOrNull { it.createdAt }
+            
+            _insightsState.update { 
+                InsightsUiState(
+                    isLoading = false,
+                    insights = insights,
+                    lastGenerated = lastGenerated,
+                    error = null,
+                    isApiKeyConfigured = apiKeyConfigured
+                )
+            }
+        }
+    }
+
+    fun dismissInsight(insightId: String) {
+        viewModelScope.launch {
+            insightDao.deleteInsight(insightId)
+            loadInsights()
+        }
+    }
+}
+
+data class InsightsUiState(
+    val isLoading: Boolean = false,
+    val insights: List<Insight> = emptyList(),
+    val lastGenerated: Instant? = null,
+    val error: String? = null,
+    val isApiKeyConfigured: Boolean = false
+)
